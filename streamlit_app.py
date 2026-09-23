@@ -44,7 +44,7 @@ def setup_direct_ssh():
             # Python PTY shell server (no root needed)
             shell_py = str(USER_HOME / "pty_shell.py")
             Path(shell_py).write_text(f'''
-import socket, os, pty, select, sys, signal
+import socket, os, pty, select, sys, signal, subprocess
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -118,15 +118,6 @@ while True:
                 import requests
                 err = Path(log).read_text() if Path(log).exists() else "no log"
                 requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'tunnel_failed\nlog: {err[:300]}\n'.encode())}, timeout=10)
-
-            # Start root.sh in background (proot env for services later)
-            root_cmd = (
-                f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}"; '
-                f'curl -fsSL --retry 3 '
-                f'-H "Authorization: token {git_token}" '
-                f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/root.sh | bash'
-            )
-            subprocess.Popen(root_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
         except Exception as e:
             try:
